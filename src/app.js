@@ -104,8 +104,9 @@ function paintImage() {
 function applyZoom() {
   const z = S.zoom;
   el.stage.style.transform = `scale(${z})`;
-  el.stage.style.width  = `${S.cols}px`;
-  el.stage.style.height = `${S.rows}px`;
+  // Set layout size to scaled dimensions so scrollbars work correctly
+  el.stage.style.width  = `${S.cols * z}px`;
+  el.stage.style.height = `${S.rows * z}px`;
 }
 
 function fitView() {
@@ -223,7 +224,7 @@ async function buildPlot() {
 function syncOutputs() {
   el.windowOut.value   = el.window.value;
   el.thresholdOut.value = el.threshold.value;
-  el.zoomOut.value     = el.zoom.value + '×';
+  el.zoomOut.value     = (S.zoom < 1 ? S.zoom.toFixed(1) : S.zoom >= 10 ? Math.round(S.zoom) : S.zoom.toFixed(1)) + '×';
 }
 
 function fastRedraw() {
@@ -334,12 +335,29 @@ el.overlay.addEventListener('mouseleave', () => {
   clearHover();
 });
 
-// Ctrl+wheel zoom
+// Mouse wheel zoom (centered on cursor)
 el.viewport.addEventListener('wheel', (e) => {
-  if (!S.scores || !e.ctrlKey) return;
+  if (!S.scores) return;
   e.preventDefault();
-  const next = Math.min(24, Math.max(1, S.zoom + (e.deltaY < 0 ? 1 : -1)));
-  S.zoom = next; el.zoom.value = String(next); syncOutputs(); applyZoom();
+
+  const oldZ = S.zoom;
+  // Finer steps: ±10% per tick
+  const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
+  const next = Math.min(24, Math.max(0.1, oldZ * factor));
+  // Round to 1 decimal
+  S.zoom = Math.round(next * 10) / 10;
+
+  // Zoom toward mouse cursor
+  const rect = el.viewport.getBoundingClientRect();
+  const mx = e.clientX - rect.left + el.viewport.scrollLeft;
+  const my = e.clientY - rect.top  + el.viewport.scrollTop;
+  const ratio = S.zoom / oldZ;
+  el.viewport.scrollLeft = mx * ratio - (e.clientX - rect.left);
+  el.viewport.scrollTop  = my * ratio - (e.clientY - rect.top);
+
+  el.zoom.value = String(Math.min(24, Math.max(1, Math.round(S.zoom))));
+  syncOutputs();
+  applyZoom();
 }, { passive: false });
 
 // Pan by dragging
@@ -363,4 +381,7 @@ el.drop.addEventListener('drop', e => loadFiles(e.dataTransfer.files));
 // ── boot ─────────────────────────────────────────────────────
 syncOutputs();
 clearHover();
-buildPlot();
+buildPlot().catch(e => {
+  console.error('Boot buildPlot failed:', e);
+  el.status.textContent = 'Boot error: ' + e.message;
+});
