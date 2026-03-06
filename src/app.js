@@ -1,575 +1,353 @@
-const state = {
-  seqA: '',
-  seqB: '',
-  scoreGrid: null,
-  normalizedGrid: null,
-  displayGrid: null,
-  pixelSize: 4,
-  zoom: 4,
-  threshold: 0.55,
-  windowSize: 9,
-  showTrace: true,
-  lastHover: null,
-  hoverFrame: 0,
-  pendingHover: null,
-  worker: null,
-  pan: { active: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0 },
+/* ── Doter: main app ───────────────────────────────────────────
+   Clean rewrite.  Canvas is always 1 pixel = 1 cell.
+   Zoom is pure CSS transform.  Hover never causes layout reflow. */
+
+// ── state ────────────────────────────────────────────────────
+const S = {
+  seqA: '', seqB: '',
+  norm: null, pixels: null, rows: 0, cols: 0,
+  threshold: 0.55, windowSize: 9, zoom: 1,
+  showTrace: true, lastRow: -1, lastCol: -1,
+  worker: null, computing: false,
 };
 
-const els = {
-  seqA: document.querySelector('#seqA'),
-  seqB: document.querySelector('#seqB'),
-  renderBtn: document.querySelector('#renderBtn'),
-  recalcBtn: document.querySelector('#recalcBtn'),
-  exampleBtn: document.querySelector('#exampleBtn'),
-  windowSize: document.querySelector('#windowSize'),
-  threshold: document.querySelector('#threshold'),
-  pixelSize: document.querySelector('#pixelSize'),
-  zoomLevel: document.querySelector('#zoomLevel'),
-  windowSizeValue: document.querySelector('#windowSizeValue'),
-  thresholdValue: document.querySelector('#thresholdValue'),
-  pixelSizeValue: document.querySelector('#pixelSizeValue'),
-  zoomLevelValue: document.querySelector('#zoomLevelValue'),
-  scoreMode: document.querySelector('#scoreMode'),
-  reverseB: document.querySelector('#reverseB'),
-  showTrace: document.querySelector('#showTrace'),
-  fitViewBtn: document.querySelector('#fitViewBtn'),
-  exportPngBtn: document.querySelector('#exportPngBtn'),
-  exportSvgBtn: document.querySelector('#exportSvgBtn'),
-  statusLine: document.querySelector('#statusLine'),
-  hoverInfo: document.querySelector('#hoverInfo'),
-  alignmentMeta: document.querySelector('#alignmentMeta'),
-  alignmentPanel: document.querySelector('#alignmentPanel'),
-  dropZone: document.querySelector('#dropZone'),
-  canvasViewport: document.querySelector('#canvasViewport'),
-  canvasStage: document.querySelector('#canvasStage'),
-  plotCanvas: document.querySelector('#plotCanvas'),
-  overlayCanvas: document.querySelector('#overlayCanvas'),
+// ── DOM refs ─────────────────────────────────────────────────
+const $ = (sel) => document.querySelector(sel);
+const el = {
+  seqA:        $('#seqA'),
+  seqB:        $('#seqB'),
+  render:      $('#renderBtn'),
+  recalc:      $('#recalcBtn'),
+  example:     $('#exampleBtn'),
+  window:      $('#windowSize'),
+  windowOut:   $('#windowSizeValue'),
+  threshold:   $('#threshold'),
+  thresholdOut:$('#thresholdValue'),
+  zoom:        $('#zoomLevel'),
+  zoomOut:     $('#zoomLevelValue'),
+  mode:        $('#scoreMode'),
+  revB:        $('#reverseB'),
+  trace:       $('#showTrace'),
+  fit:         $('#fitViewBtn'),
+  pngBtn:      $('#exportPngBtn'),
+  svgBtn:      $('#exportSvgBtn'),
+  status:      $('#statusLine'),
+  hover:       $('#hoverInfo'),
+  aMeta:       $('#alignmentMeta'),
+  aPanel:      $('#alignmentPanel'),
+  drop:        $('#dropZone'),
+  viewport:    $('#canvasViewport'),
+  stage:       $('#canvasStage'),
+  plot:        $('#plotCanvas'),
+  overlay:     $('#overlayCanvas'),
 };
+const plotCtx = el.plot.getContext('2d', { alpha: false });
+const overCtx = el.overlay.getContext('2d');
 
-const plotCtx = els.plotCanvas.getContext('2d', { alpha: false });
-const overlayCtx = els.overlayCanvas.getContext('2d');
-
+// ── helpers ──────────────────────────────────────────────────
 function parseFasta(raw) {
-  return raw
-    .split(/\r?\n/)
-    .filter((line) => !line.startsWith('>'))
-    .join('')
-    .replace(/\s+/g, '')
-    .toUpperCase();
+  return raw.split(/\r?\n/).filter(l => !l.startsWith('>')).join('').replace(/\s+/g, '').toUpperCase();
+}
+function revComp(seq) {
+  const m = { A:'T', C:'G', G:'C', T:'A', U:'A', N:'N' };
+  return [...seq].reverse().map(b => m[b] ?? 'N').join('');
 }
 
-function reverseComplement(seq) {
-  const map = { A: 'T', C: 'G', G: 'C', T: 'A', U: 'A', N: 'N' };
-  return [...seq].reverse().map((base) => map[base] ?? 'N').join('');
+// ── worker ───────────────────────────────────────────────────
+function getWorker() {
+  if (!S.worker) S.worker = new Worker('./src/worker.js');
+  return S.worker;
 }
 
-function ensureWorker() {
-  if (state.worker) return state.worker;
-  state.worker = new Worker('./src/worker.js', { type: 'module' });
-  return state.worker;
-}
-
-function computeDotplot(seqA, seqB, windowSize, mode) {
-  const worker = ensureWorker();
-  return new Promise((resolve, reject) => {
-    const onMessage = (event) => {
-      worker.removeEventListener('message', onMessage);
-      worker.removeEventListener('error', onError);
-      const { normalized, rows, cols, min, max, error } = event.data;
-      if (error) {
-        reject(new Error(error));
-        return;
-      }
-      resolve({
-        normalized: normalized.map((row) => Float32Array.from(row)),
-        rows,
-        cols,
-        min,
-        max,
-      });
+function compute(seqA, seqB, windowSize, mode) {
+  return new Promise((res, rej) => {
+    const w = getWorker();
+    const ok = (e) => { w.removeEventListener('message', ok); w.removeEventListener('error', no);
+      if (e.data.error) { rej(new Error(e.data.error)); return; }
+      res(e.data);
     };
-    const onError = (error) => {
-      worker.removeEventListener('message', onMessage);
-      worker.removeEventListener('error', onError);
-      reject(error);
-    };
-    worker.addEventListener('message', onMessage);
-    worker.addEventListener('error', onError);
-    worker.postMessage({ seqA, seqB, windowSize, mode });
+    const no = (e) => { w.removeEventListener('message', ok); w.removeEventListener('error', no); rej(e); };
+    w.addEventListener('message', ok);
+    w.addEventListener('error', no);
+    w.postMessage({ seqA, seqB, windowSize, mode });
   });
 }
 
-function resizeCanvases(cols, rows, pixelSize) {
-  const width = cols * pixelSize;
-  const height = rows * pixelSize;
-  for (const canvas of [els.plotCanvas, els.overlayCanvas]) {
-    canvas.width = width;
-    canvas.height = height;
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
+// ── rendering ────────────────────────────────────────────────
+function sizeCanvas(rows, cols) {
+  // Canvas = exactly rows × cols pixels.  Zoom is CSS only.
+  for (const c of [el.plot, el.overlay]) {
+    c.width = cols; c.height = rows;
   }
-  els.canvasStage.style.width = `${width}px`;
-  els.canvasStage.style.height = `${height}px`;
+}
+
+function paintImage() {
+  const { pixels, rows, cols, norm, threshold } = { ...S, threshold: S.threshold };
+  if (!pixels) return;
+  sizeCanvas(rows, cols);
+  const img = plotCtx.createImageData(cols, rows);
+  const d = img.data;
+  const thr = S.threshold;
+  for (let i = 0, j = 0; i < rows * cols; i += 1, j += 4) {
+    const v = norm[i] >= thr ? 0 : pixels[i];
+    d[j] = v; d[j+1] = v; d[j+2] = v; d[j+3] = 255;
+  }
+  plotCtx.putImageData(img, 0, 0);
 }
 
 function applyZoom() {
-  els.canvasStage.style.transform = `scale(${state.zoom})`;
-}
-
-function buildDisplayGrid() {
-  if (!state.normalizedGrid) return;
-  const { normalized, rows, cols } = state.normalizedGrid;
-  const maxDisplayDimension = 1400;
-  const rowStep = Math.max(1, Math.ceil(rows / maxDisplayDimension));
-  const colStep = Math.max(1, Math.ceil(cols / maxDisplayDimension));
-  const displayRows = Math.ceil(rows / rowStep);
-  const displayCols = Math.ceil(cols / colStep);
-  const display = Array.from({ length: displayRows }, () => new Float32Array(displayCols));
-
-  for (let y = 0; y < displayRows; y += 1) {
-    for (let x = 0; x < displayCols; x += 1) {
-      let best = 0;
-      const yStart = y * rowStep;
-      const yEnd = Math.min(rows, yStart + rowStep);
-      const xStart = x * colStep;
-      const xEnd = Math.min(cols, xStart + colStep);
-      for (let iy = yStart; iy < yEnd; iy += 1) {
-        for (let ix = xStart; ix < xEnd; ix += 1) {
-          if (normalized[iy][ix] > best) best = normalized[iy][ix];
-        }
-      }
-      display[y][x] = best;
-    }
-  }
-
-  state.displayGrid = {
-    normalized: display,
-    rows: displayRows,
-    cols: displayCols,
-    rowStep,
-    colStep,
-  };
-}
-
-function renderPlot() {
-  const { normalized, rows, cols } = state.displayGrid;
-  resizeCanvases(cols, rows, state.pixelSize);
-  const image = plotCtx.createImageData(cols, rows);
-
-  for (let y = 0; y < rows; y += 1) {
-    for (let x = 0; x < cols; x += 1) {
-      const idx = (y * cols + x) * 4;
-      const value = normalized[y][x] >= state.threshold ? 0 : 255 - Math.round(normalized[y][x] * 255);
-      image.data[idx] = value;
-      image.data[idx + 1] = value;
-      image.data[idx + 2] = value;
-      image.data[idx + 3] = 255;
-    }
-  }
-
-  const temp = document.createElement('canvas');
-  temp.width = cols;
-  temp.height = rows;
-  temp.getContext('2d').putImageData(image, 0, 0);
-  plotCtx.save();
-  plotCtx.imageSmoothingEnabled = false;
-  plotCtx.clearRect(0, 0, els.plotCanvas.width, els.plotCanvas.height);
-  plotCtx.drawImage(temp, 0, 0, cols, rows, 0, 0, els.plotCanvas.width, els.plotCanvas.height);
-  plotCtx.restore();
-}
-
-function computeTrace(row, col) {
-  const trace = [{ row, col }];
-  let r = row - 1;
-  let c = col - 1;
-  while (r >= 0 && c >= 0 && state.normalizedGrid.normalized[r][c] >= state.threshold) {
-    trace.unshift({ row: r, col: c });
-    r -= 1;
-    c -= 1;
-  }
-  r = row + 1;
-  c = col + 1;
-  while (r < state.normalizedGrid.rows && c < state.normalizedGrid.cols && state.normalizedGrid.normalized[r][c] >= state.threshold) {
-    trace.push({ row: r, col: c });
-    r += 1;
-    c += 1;
-  }
-  return trace;
-}
-
-function computeLocalAlignment(aSlice, bSlice) {
-  const matchScore = 2;
-  const mismatchScore = -1;
-  const gapScore = -2;
-  const rows = aSlice.length + 1;
-  const cols = bSlice.length + 1;
-  const score = Array.from({ length: rows }, () => new Int16Array(cols));
-  const pointer = Array.from({ length: rows }, () => new Uint8Array(cols));
-  let best = { value: 0, row: 0, col: 0 };
-
-  for (let i = 1; i < rows; i += 1) {
-    for (let j = 1; j < cols; j += 1) {
-      const diag = score[i - 1][j - 1] + (aSlice[i - 1] === bSlice[j - 1] ? matchScore : mismatchScore);
-      const up = score[i - 1][j] + gapScore;
-      const left = score[i][j - 1] + gapScore;
-      const cell = Math.max(0, diag, up, left);
-      score[i][j] = cell;
-      if (cell === 0) pointer[i][j] = 0;
-      else if (cell === diag) pointer[i][j] = 1;
-      else if (cell === up) pointer[i][j] = 2;
-      else pointer[i][j] = 3;
-      if (cell > best.value) {
-        best = { value: cell, row: i, col: j };
-      }
-    }
-  }
-
-  const alignedA = [];
-  const alignedB = [];
-  const guide = [];
-  let i = best.row;
-  let j = best.col;
-  while (i > 0 && j > 0 && score[i][j] > 0) {
-    const move = pointer[i][j];
-    if (move === 1) {
-      const aChar = aSlice[i - 1];
-      const bChar = bSlice[j - 1];
-      alignedA.push(aChar);
-      alignedB.push(bChar);
-      guide.push(aChar === bChar ? '|' : '.');
-      i -= 1;
-      j -= 1;
-    } else if (move === 2) {
-      alignedA.push(aSlice[i - 1]);
-      alignedB.push('-');
-      guide.push(' ');
-      i -= 1;
-    } else if (move === 3) {
-      alignedA.push('-');
-      alignedB.push(bSlice[j - 1]);
-      guide.push(' ');
-      j -= 1;
-    } else {
-      break;
-    }
-  }
-
-  return {
-    score: best.value,
-    startA: i,
-    startB: j,
-    alignedA: alignedA.reverse().join(''),
-    alignedB: alignedB.reverse().join(''),
-    guide: guide.reverse().join(''),
-  };
-}
-
-function buildAlignmentPanel(trace, row, col) {
-  const radius = Math.min(80, Math.max(12, Math.floor(state.windowSize * 1.5)));
-  const aStart = Math.max(0, row - radius);
-  const aEnd = Math.min(state.seqA.length, row + radius + 1);
-  const bStart = Math.max(0, col - radius);
-  const bEnd = Math.min(state.seqB.length, col + radius + 1);
-  const aSlice = state.seqA.slice(aStart, aEnd);
-  const bSlice = state.seqB.slice(bStart, bEnd);
-  const alignment = computeLocalAlignment(aSlice, bSlice);
-  const traceSpan = trace.length ? `${trace[0].row + 1}:${trace[0].col + 1} → ${trace.at(-1).row + 1}:${trace.at(-1).col + 1}` : 'single point';
-  els.alignmentMeta.textContent = `Cursor A:${row + 1} B:${col + 1} · trace ${trace.length} cells · span ${traceSpan} · local score ${alignment.score}`;
-  els.alignmentPanel.textContent = `A ${String(aStart + alignment.startA + 1).padStart(5, ' ')}  ${alignment.alignedA}\n          ${alignment.guide}\nB ${String(bStart + alignment.startB + 1).padStart(5, ' ')}  ${alignment.alignedB}`;
-}
-
-function drawOverlay(row, col) {
-  overlayCtx.clearRect(0, 0, els.overlayCanvas.width, els.overlayCanvas.height);
-  state.lastHover = { row, col };
-  if (!state.displayGrid) return;
-  const displayCol = Math.floor(col / state.displayGrid.colStep);
-  const displayRow = Math.floor(row / state.displayGrid.rowStep);
-  const px = displayCol * state.pixelSize;
-  const py = displayRow * state.pixelSize;
-
-  overlayCtx.strokeStyle = 'rgba(120, 196, 255, 0.95)';
-  overlayCtx.lineWidth = 1;
-  overlayCtx.beginPath();
-  overlayCtx.moveTo(0, py + state.pixelSize / 2);
-  overlayCtx.lineTo(els.overlayCanvas.width, py + state.pixelSize / 2);
-  overlayCtx.moveTo(px + state.pixelSize / 2, 0);
-  overlayCtx.lineTo(px + state.pixelSize / 2, els.overlayCanvas.height);
-  overlayCtx.stroke();
-
-  if (state.showTrace) {
-    const trace = computeTrace(row, col);
-    overlayCtx.fillStyle = 'rgba(142, 255, 193, 0.9)';
-    for (const point of trace) {
-      const traceCol = Math.floor(point.col / state.displayGrid.colStep);
-      const traceRow = Math.floor(point.row / state.displayGrid.rowStep);
-      overlayCtx.fillRect(
-        traceCol * state.pixelSize,
-        traceRow * state.pixelSize,
-        state.pixelSize,
-        state.pixelSize,
-      );
-    }
-    buildAlignmentPanel(trace, row, col);
-  } else {
-    buildAlignmentPanel([], row, col);
-  }
-
-  const snippetA = state.seqA.slice(Math.max(0, row - 12), Math.min(state.seqA.length, row + 13));
-  const snippetB = state.seqB.slice(Math.max(0, col - 12), Math.min(state.seqB.length, col + 13));
-  const score = state.normalizedGrid.normalized[row][col];
-  els.hoverInfo.textContent = `A:${row + 1}/${state.seqA.length} B:${col + 1}/${state.seqB.length} score=${score.toFixed(3)} | ${snippetA} :: ${snippetB}`;
-}
-
-async function buildPlot() {
-  const seqA = parseFasta(els.seqA.value);
-  let seqB = parseFasta(els.seqB.value);
-  if (!seqA || !seqB) {
-    els.statusLine.textContent = 'Please provide two sequences.';
-    return;
-  }
-
-  if (els.reverseB.checked) {
-    seqB = reverseComplement(seqB);
-  }
-
-  state.seqA = seqA;
-  state.seqB = seqB;
-  state.windowSize = Number(els.windowSize.value);
-  state.threshold = Number(els.threshold.value) / 100;
-  state.pixelSize = Number(els.pixelSize.value);
-  state.zoom = Number(els.zoomLevel.value);
-  state.showTrace = els.showTrace.checked;
-
-  const start = performance.now();
-  els.statusLine.textContent = `Computing ${seqA.length} × ${seqB.length} score image…`;
-  try {
-    state.normalizedGrid = await computeDotplot(seqA, seqB, state.windowSize, els.scoreMode.value);
-  } catch (error) {
-    els.statusLine.textContent = `Failed to compute matrix: ${error.message}`;
-    return;
-  }
-  const ms = performance.now() - start;
-  buildDisplayGrid();
-  if (seqA.length > 1000 || seqB.length > 1000) {
-    fitView();
-  }
-  renderPlot();
-  applyZoom();
-  overlayCtx.clearRect(0, 0, els.overlayCanvas.width, els.overlayCanvas.height);
-  els.alignmentMeta.textContent = 'Hover over the matrix to inspect the diagonal neighborhood.';
-  els.alignmentPanel.textContent = `A: —\n   \nB: —`;
-  els.statusLine.textContent = `Computed ${seqA.length} × ${seqB.length} windowed scores in ${ms.toFixed(1)} ms. Threshold-only changes redraw instantly; window/mode changes recalculate.`;
-}
-
-function updateOutputs() {
-  els.windowSizeValue.value = els.windowSize.value;
-  els.thresholdValue.value = els.threshold.value;
-  els.pixelSizeValue.value = els.pixelSize.value;
-  els.zoomLevelValue.value = `${els.zoomLevel.value}×`;
+  const z = S.zoom;
+  el.stage.style.transform = `scale(${z})`;
+  el.stage.style.width  = `${S.cols}px`;
+  el.stage.style.height = `${S.rows}px`;
 }
 
 function fitView() {
-  if (!state.normalizedGrid || !state.displayGrid) return;
-  const availableWidth = els.canvasViewport.clientWidth || 1;
-  const availableHeight = els.canvasViewport.clientHeight || 1;
-  const plotWidth = state.displayGrid.cols * state.pixelSize;
-  const plotHeight = state.displayGrid.rows * state.pixelSize;
-  const scale = Math.min(24, Math.max(1, Math.floor(Math.min(availableWidth / plotWidth, availableHeight / plotHeight) * 10) / 10));
-  state.zoom = scale;
-  els.zoomLevel.value = String(Math.round(scale));
-  updateOutputs();
+  if (!S.pixels) return;
+  const vw = el.viewport.clientWidth  || 600;
+  const vh = el.viewport.clientHeight || 600;
+  const z = Math.max(1, Math.min(Math.floor(vw / S.cols), Math.floor(vh / S.rows), 24));
+  S.zoom = z;
+  el.zoom.value = String(z);
+  el.zoomOut.value = z + '×';
   applyZoom();
 }
 
-function triggerDownload(name, href) {
-  const link = document.createElement('a');
-  link.href = href;
-  link.download = name;
-  link.click();
+// ── overlay (crosshair + trace) ──────────────────────────────
+function drawOverlay(row, col) {
+  const ctx = overCtx;
+  const w = S.cols, h = S.rows;
+  ctx.clearRect(0, 0, w, h);
+
+  // crosshair
+  ctx.strokeStyle = 'rgba(120,196,255,0.85)';
+  ctx.lineWidth = 1 / S.zoom;        // stays thin at any zoom
+  ctx.beginPath();
+  ctx.moveTo(0, row + 0.5); ctx.lineTo(w, row + 0.5);
+  ctx.moveTo(col + 0.5, 0); ctx.lineTo(col + 0.5, h);
+  ctx.stroke();
+
+  // diagonal trace
+  if (S.showTrace) {
+    ctx.fillStyle = 'rgba(142,255,193,0.8)';
+    let r = row, c = col;
+    while (r >= 0 && c >= 0 && S.norm[r * w + c] >= S.threshold) { ctx.fillRect(c, r, 1, 1); r--; c--; }
+    r = row + 1; c = col + 1;
+    while (r < h && c < w && S.norm[r * w + c] >= S.threshold) { ctx.fillRect(c, r, 1, 1); r++; c++; }
+  }
 }
 
-function exportPng() {
-  if (!state.normalizedGrid) return;
-  const merged = document.createElement('canvas');
-  merged.width = els.plotCanvas.width;
-  merged.height = els.plotCanvas.height;
-  const ctx = merged.getContext('2d');
-  ctx.drawImage(els.plotCanvas, 0, 0);
-  if (state.lastHover) {
-    ctx.drawImage(els.overlayCanvas, 0, 0);
-  }
-  triggerDownload('doter-plot.png', merged.toDataURL('image/png'));
+// ── alignment panel ──────────────────────────────────────────
+function updateAlignment(row, col) {
+  const radius = 20;
+  const aS = Math.max(0, row - radius), aE = Math.min(S.seqA.length, row + radius + 1);
+  const bS = Math.max(0, col - radius), bE = Math.min(S.seqB.length, col + radius + 1);
+  const aSlice = S.seqA.slice(aS, aE);
+  const bSlice = S.seqB.slice(bS, bE);
+  const guide = [];
+  const len = Math.min(aSlice.length, bSlice.length);
+  for (let i = 0; i < len; i++) guide.push(aSlice[i] === bSlice[i] ? '|' : ' ');
+  el.aMeta.textContent = `A:${row+1}  B:${col+1}  score ${S.norm[row * S.cols + col].toFixed(3)}`;
+  el.aPanel.textContent =
+    `A ${String(aS+1).padStart(5)}  ${aSlice}\n` +
+    `          ${guide.join('')}\n` +
+    `B ${String(bS+1).padStart(5)}  ${bSlice}`;
 }
 
-function exportSvg() {
-  if (!state.normalizedGrid) return;
-  const { normalized, rows, cols } = state.normalizedGrid;
-  const parts = [
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${cols}" height="${rows}" viewBox="0 0 ${cols} ${rows}" shape-rendering="crispEdges">`,
-    '<rect width="100%" height="100%" fill="white"/>',
-  ];
-  for (let y = 0; y < rows; y += 1) {
-    for (let x = 0; x < cols; x += 1) {
-      const value = normalized[y][x] >= state.threshold ? 0 : 255 - Math.round(normalized[y][x] * 255);
-      const hex = value.toString(16).padStart(2, '0');
-      parts.push(`<rect x="${x}" y="${y}" width="1" height="1" fill="#${hex}${hex}${hex}"/>`);
-    }
-  }
-  if (state.lastHover) {
-    parts.push(`<line x1="0" x2="${cols}" y1="${state.lastHover.row + 0.5}" y2="${state.lastHover.row + 0.5}" stroke="#78c4ff" stroke-width="0.15"/>`);
-    parts.push(`<line y1="0" y2="${rows}" x1="${state.lastHover.col + 0.5}" x2="${state.lastHover.col + 0.5}" stroke="#78c4ff" stroke-width="0.15"/>`);
-  }
-  parts.push('</svg>');
-  const blob = new Blob([parts.join('')], { type: 'image/svg+xml;charset=utf-8' });
-  triggerDownload('doter-plot.svg', URL.createObjectURL(blob));
+// ── hover info (fixed height, no reflow) ─────────────────────
+function updateHover(row, col) {
+  const sc = S.norm[row * S.cols + col];
+  el.hover.textContent = `A:${row+1}/${S.rows}  B:${col+1}/${S.cols}  score=${sc.toFixed(3)}`;
+}
+function clearHover() {
+  el.hover.textContent = '\u00a0';   // non-breaking space keeps height
+  el.aMeta.textContent = '\u00a0';
+  el.aPanel.textContent = 'A: —\n   \nB: —';
+  overCtx.clearRect(0, 0, S.cols, S.rows);
+  S.lastRow = S.lastCol = -1;
 }
 
-async function readSequenceFiles(files) {
-  const fastaFiles = [...files].filter((file) => file.type.startsWith('text') || /\.(fa|fasta|fna|fas|txt)$/i.test(file.name));
-  if (!fastaFiles.length) {
-    els.statusLine.textContent = 'Drop FASTA or plain-text sequence files.';
+// ── main build ───────────────────────────────────────────────
+async function buildPlot() {
+  if (S.computing) return;
+  const seqA = parseFasta(el.seqA.value);
+  let seqB = parseFasta(el.seqB.value);
+  if (!seqA || !seqB) { el.status.textContent = 'Provide two sequences.'; return; }
+  if (el.revB.checked) seqB = revComp(seqB);
+
+  S.seqA = seqA; S.seqB = seqB;
+  S.windowSize = Number(el.window.value);
+  S.threshold = Number(el.threshold.value) / 100;
+  S.zoom = Number(el.zoom.value);
+  S.showTrace = el.trace.checked;
+
+  const total = seqA.length * seqB.length;
+  el.status.textContent = `Computing ${seqA.length} × ${seqB.length} (${(total/1e6).toFixed(1)}M cells)…`;
+  S.computing = true;
+
+  const t0 = performance.now();
+  try {
+    const result = await compute(seqA, seqB, S.windowSize, el.mode.value);
+    S.pixels = new Uint8Array(result.pixels);   // may have been transferred
+    S.norm   = new Float32Array(result.norm);
+    S.rows   = result.rows;
+    S.cols   = result.cols;
+  } catch (err) {
+    el.status.textContent = `Error: ${err.message}`;
+    S.computing = false;
     return;
   }
-  const contents = await Promise.all(fastaFiles.slice(0, 2).map((file) => file.text()));
-  if (contents[0]) els.seqA.value = contents[0];
-  if (contents[1]) els.seqB.value = contents[1];
-  els.statusLine.textContent = `Loaded ${contents.length} sequence file${contents.length > 1 ? 's' : ''}. Click Render plot or Recalculate scores.`;
+  const ms = performance.now() - t0;
+  S.computing = false;
+
+  paintImage();
+  fitView();
+  clearHover();
+  el.status.textContent = `${seqA.length} × ${seqB.length} in ${ms < 1000 ? ms.toFixed(0) + ' ms' : (ms/1000).toFixed(1) + ' s'}.`;
 }
 
-function updateFastRender() {
-  if (!state.normalizedGrid || !state.displayGrid) return;
-  state.threshold = Number(els.threshold.value) / 100;
-  state.pixelSize = Number(els.pixelSize.value);
-  state.zoom = Number(els.zoomLevel.value);
-  renderPlot();
-  applyZoom();
-  if (state.lastHover) {
-    drawOverlay(state.lastHover.row, state.lastHover.col);
-  }
-  els.statusLine.textContent = 'Redrew current score image with updated threshold / zoom / pixel size.';
+// ── slider updates (no recompute) ────────────────────────────
+function syncOutputs() {
+  el.windowOut.value   = el.window.value;
+  el.thresholdOut.value = el.threshold.value;
+  el.zoomOut.value     = el.zoom.value + '×';
 }
 
+function fastRedraw() {
+  if (!S.pixels) return;
+  S.threshold = Number(el.threshold.value) / 100;
+  paintImage();
+  if (S.lastRow >= 0) drawOverlay(S.lastRow, S.lastCol);
+}
+
+// ── exports ──────────────────────────────────────────────────
+function download(name, href) {
+  const a = document.createElement('a'); a.href = href; a.download = name; a.click();
+}
+function exportPng() {
+  if (!S.pixels) return;
+  // Composite plot + overlay at 1:1
+  const c = document.createElement('canvas'); c.width = S.cols; c.height = S.rows;
+  const ctx = c.getContext('2d');
+  ctx.drawImage(el.plot, 0, 0);
+  ctx.drawImage(el.overlay, 0, 0);
+  download('doter.png', c.toDataURL('image/png'));
+}
+function exportSvg() {
+  if (!S.pixels) return;
+  // Encode the plot canvas as a PNG data-url embedded in an SVG for vector wrapper
+  const c = document.createElement('canvas'); c.width = S.cols; c.height = S.rows;
+  c.getContext('2d').drawImage(el.plot, 0, 0);
+  const dataUrl = c.toDataURL('image/png');
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${S.cols}" height="${S.rows}">` +
+    `<image href="${dataUrl}" width="${S.cols}" height="${S.rows}" image-rendering="pixelated"/>` +
+    `</svg>`;
+  download('doter.svg', URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' })));
+}
+
+// ── drag-drop ────────────────────────────────────────────────
+async function loadFiles(files) {
+  const ok = [...files].filter(f => f.type.startsWith('text') || /\.(fa|fasta|fna|fas|txt)$/i.test(f.name));
+  if (!ok.length) { el.status.textContent = 'Drop FASTA / text files.'; return; }
+  const texts = await Promise.all(ok.slice(0, 2).map(f => f.text()));
+  if (texts[0]) el.seqA.value = texts[0];
+  if (texts[1]) el.seqB.value = texts[1];
+  el.status.textContent = `Loaded ${texts.length} file(s). Click Render.`;
+}
+
+// ── example ──────────────────────────────────────────────────
 function loadExample() {
-  els.seqA.value = `>repeat_A\nTTTCGAGACCTGAAACTGTTTCGAGACCTGAAACTGTTTCGAGACCTGAAACTG`;
-  els.seqB.value = `>repeat_B\nTTTCGAGACCTGAAACTGATTCGAGACCGGAAACTGTTTCGAGACCTGAAACTG`;
+  el.seqA.value = '>repeat_A\nTTTCGAGACCTGAAACTGTTTCGAGACCTGAAACTGTTTCGAGACCTGAAACTG';
+  el.seqB.value = '>repeat_B\nTTTCGAGACCTGAAACTGATTCGAGACCGGAAACTGTTTCGAGACCTGAAACTG';
   buildPlot();
 }
 
-for (const input of [els.threshold, els.pixelSize, els.zoomLevel]) {
-  input.addEventListener('input', () => {
-    updateOutputs();
-    updateFastRender();
-  });
-}
+// ── event wiring ─────────────────────────────────────────────
 
-for (const input of [els.windowSize, els.scoreMode, els.reverseB]) {
-  input.addEventListener('input', updateOutputs);
-  input.addEventListener('change', () => {
-    els.statusLine.textContent = 'Window/mode/orientation changed. Recalculate scores to update the matrix.';
-  });
-}
+// Render / recalc
+el.render.addEventListener('click', buildPlot);
+el.recalc.addEventListener('click', buildPlot);
+el.example.addEventListener('click', loadExample);
+el.fit.addEventListener('click', fitView);
+el.pngBtn.addEventListener('click', exportPng);
+el.svgBtn.addEventListener('click', exportSvg);
 
-els.showTrace.addEventListener('change', () => {
-  state.showTrace = els.showTrace.checked;
-  if (state.lastHover) {
-    drawOverlay(state.lastHover.row, state.lastHover.col);
-  }
-});
+// Threshold → instant repaint (no recompute)
+el.threshold.addEventListener('input', () => { syncOutputs(); fastRedraw(); });
 
-els.renderBtn.addEventListener('click', buildPlot);
-els.recalcBtn.addEventListener('click', buildPlot);
-els.exampleBtn.addEventListener('click', loadExample);
-els.fitViewBtn.addEventListener('click', fitView);
-els.exportPngBtn.addEventListener('click', exportPng);
-els.exportSvgBtn.addEventListener('click', exportSvg);
-
-els.overlayCanvas.addEventListener('mousemove', (event) => {
-  if (!state.normalizedGrid || !state.displayGrid) return;
-  const rect = els.overlayCanvas.getBoundingClientRect();
-  const scale = state.zoom || 1;
-  const displayCol = Math.floor((event.clientX - rect.left) / (state.pixelSize * scale));
-  const displayRow = Math.floor((event.clientY - rect.top) / (state.pixelSize * scale));
-  const col = Math.min(state.normalizedGrid.cols - 1, displayCol * state.displayGrid.colStep);
-  const row = Math.min(state.normalizedGrid.rows - 1, displayRow * state.displayGrid.rowStep);
-  if (
-    row < 0 ||
-    col < 0 ||
-    row >= state.normalizedGrid.rows ||
-    col >= state.normalizedGrid.cols
-  ) {
-    return;
-  }
-  state.pendingHover = { row, col };
-  if (!state.hoverFrame) {
-    state.hoverFrame = requestAnimationFrame(() => {
-      state.hoverFrame = 0;
-      if (state.pendingHover) {
-        drawOverlay(state.pendingHover.row, state.pendingHover.col);
-      }
-    });
-  }
-});
-
-els.overlayCanvas.addEventListener('mouseleave', () => {
-  if (state.hoverFrame) {
-    cancelAnimationFrame(state.hoverFrame);
-    state.hoverFrame = 0;
-  }
-  state.pendingHover = null;
-  overlayCtx.clearRect(0, 0, els.overlayCanvas.width, els.overlayCanvas.height);
-  els.hoverInfo.textContent = 'Hover over the plot to inspect coordinates.';
-  els.alignmentMeta.textContent = 'Hover over the matrix to inspect the diagonal neighborhood.';
-  els.alignmentPanel.textContent = `A: —\n   \nB: —`;
-});
-
-els.canvasViewport.addEventListener('mousedown', (event) => {
-  state.pan.active = true;
-  state.pan.startX = event.clientX;
-  state.pan.startY = event.clientY;
-  state.pan.scrollLeft = els.canvasViewport.scrollLeft;
-  state.pan.scrollTop = els.canvasViewport.scrollTop;
-  els.canvasViewport.classList.add('panning');
-});
-
-window.addEventListener('mouseup', () => {
-  state.pan.active = false;
-  els.canvasViewport.classList.remove('panning');
-});
-
-els.canvasViewport.addEventListener('mousemove', (event) => {
-  if (!state.pan.active) return;
-  els.canvasViewport.scrollLeft = state.pan.scrollLeft - (event.clientX - state.pan.startX);
-  els.canvasViewport.scrollTop = state.pan.scrollTop - (event.clientY - state.pan.startY);
-});
-
-els.canvasViewport.addEventListener('wheel', (event) => {
-  if (!state.normalizedGrid || !event.ctrlKey) return;
-  event.preventDefault();
-  const next = Math.min(24, Math.max(1, state.zoom + (event.deltaY < 0 ? 1 : -1)));
-  state.zoom = next;
-  els.zoomLevel.value = String(next);
-  updateOutputs();
+// Zoom → CSS only
+el.zoom.addEventListener('input', () => {
+  syncOutputs();
+  S.zoom = Number(el.zoom.value);
   applyZoom();
+});
+
+// Window / mode / revcomp → just update label, require explicit recompute
+for (const inp of [el.window, el.mode, el.revB]) {
+  inp.addEventListener('input', syncOutputs);
+  inp.addEventListener('change', () => {
+    el.status.textContent = 'Parameter changed — click Render to recompute.';
+  });
+}
+
+el.trace.addEventListener('change', () => {
+  S.showTrace = el.trace.checked;
+  if (S.lastRow >= 0) drawOverlay(S.lastRow, S.lastCol);
+});
+
+// ── mouse interaction on overlay canvas ──────────────────────
+let hoverRaf = 0;
+
+el.overlay.addEventListener('mousemove', (e) => {
+  if (!S.norm) return;
+  if (hoverRaf) return;           // skip until previous frame is done
+  hoverRaf = requestAnimationFrame(() => {
+    hoverRaf = 0;
+    const rect = el.overlay.getBoundingClientRect();
+    const z = S.zoom;
+    const col = Math.floor((e.clientX - rect.left) / z);
+    const row = Math.floor((e.clientY - rect.top) / z);
+    if (row < 0 || col < 0 || row >= S.rows || col >= S.cols) return;
+    if (row === S.lastRow && col === S.lastCol) return;  // no change
+    S.lastRow = row; S.lastCol = col;
+    drawOverlay(row, col);
+    updateHover(row, col);
+    updateAlignment(row, col);
+  });
+});
+
+el.overlay.addEventListener('mouseleave', () => {
+  if (hoverRaf) { cancelAnimationFrame(hoverRaf); hoverRaf = 0; }
+  clearHover();
+});
+
+// Ctrl+wheel zoom
+el.viewport.addEventListener('wheel', (e) => {
+  if (!S.norm || !e.ctrlKey) return;
+  e.preventDefault();
+  const next = Math.min(24, Math.max(1, S.zoom + (e.deltaY < 0 ? 1 : -1)));
+  S.zoom = next; el.zoom.value = String(next); syncOutputs(); applyZoom();
 }, { passive: false });
 
-for (const eventName of ['dragenter', 'dragover']) {
-  els.dropZone.addEventListener(eventName, (event) => {
-    event.preventDefault();
-    els.dropZone.classList.add('active');
-  });
-}
-
-for (const eventName of ['dragleave', 'drop']) {
-  els.dropZone.addEventListener(eventName, (event) => {
-    event.preventDefault();
-    els.dropZone.classList.remove('active');
-  });
-}
-
-els.dropZone.addEventListener('drop', async (event) => {
-  await readSequenceFiles(event.dataTransfer.files);
+// Pan by dragging
+let pan = null;
+el.viewport.addEventListener('mousedown', (e) => {
+  pan = { x: e.clientX, y: e.clientY, sl: el.viewport.scrollLeft, st: el.viewport.scrollTop };
+  el.viewport.classList.add('panning');
 });
+window.addEventListener('mousemove', (e) => {
+  if (!pan) return;
+  el.viewport.scrollLeft = pan.sl - (e.clientX - pan.x);
+  el.viewport.scrollTop  = pan.st - (e.clientY - pan.y);
+});
+window.addEventListener('mouseup', () => { pan = null; el.viewport.classList.remove('panning'); });
 
-updateOutputs();
+// Drop zone
+for (const ev of ['dragenter','dragover']) el.drop.addEventListener(ev, e => { e.preventDefault(); el.drop.classList.add('active'); });
+for (const ev of ['dragleave','drop'])     el.drop.addEventListener(ev, e => { e.preventDefault(); el.drop.classList.remove('active'); });
+el.drop.addEventListener('drop', e => loadFiles(e.dataTransfer.files));
+
+// ── boot ─────────────────────────────────────────────────────
+syncOutputs();
+clearHover();
 buildPlot();
