@@ -3,12 +3,15 @@ const state = {
   seqB: '',
   scoreGrid: null,
   normalizedGrid: null,
+  displayGrid: null,
   pixelSize: 4,
   zoom: 4,
   threshold: 0.55,
   windowSize: 9,
   showTrace: true,
   lastHover: null,
+  hoverFrame: 0,
+  pendingHover: null,
   worker: null,
   pan: { active: false, startX: 0, startY: 0, scrollLeft: 0, scrollTop: 0 },
 };
@@ -73,13 +76,12 @@ function computeDotplot(seqA, seqB, windowSize, mode) {
     const onMessage = (event) => {
       worker.removeEventListener('message', onMessage);
       worker.removeEventListener('error', onError);
-      const { normalized, raw, rows, cols, min, max, error } = event.data;
+      const { normalized, rows, cols, min, max, error } = event.data;
       if (error) {
         reject(new Error(error));
         return;
       }
       resolve({
-        raw: raw.map((row) => Float32Array.from(row)),
         normalized: normalized.map((row) => Float32Array.from(row)),
         rows,
         cols,
@@ -115,8 +117,43 @@ function applyZoom() {
   els.canvasStage.style.transform = `scale(${state.zoom})`;
 }
 
-function renderPlot() {
+function buildDisplayGrid() {
+  if (!state.normalizedGrid) return;
   const { normalized, rows, cols } = state.normalizedGrid;
+  const maxDisplayDimension = 1400;
+  const rowStep = Math.max(1, Math.ceil(rows / maxDisplayDimension));
+  const colStep = Math.max(1, Math.ceil(cols / maxDisplayDimension));
+  const displayRows = Math.ceil(rows / rowStep);
+  const displayCols = Math.ceil(cols / colStep);
+  const display = Array.from({ length: displayRows }, () => new Float32Array(displayCols));
+
+  for (let y = 0; y < displayRows; y += 1) {
+    for (let x = 0; x < displayCols; x += 1) {
+      let best = 0;
+      const yStart = y * rowStep;
+      const yEnd = Math.min(rows, yStart + rowStep);
+      const xStart = x * colStep;
+      const xEnd = Math.min(cols, xStart + colStep);
+      for (let iy = yStart; iy < yEnd; iy += 1) {
+        for (let ix = xStart; ix < xEnd; ix += 1) {
+          if (normalized[iy][ix] > best) best = normalized[iy][ix];
+        }
+      }
+      display[y][x] = best;
+    }
+  }
+
+  state.displayGrid = {
+    normalized: display,
+    rows: displayRows,
+    cols: displayCols,
+    rowStep,
+    colStep,
+  };
+}
+
+function renderPlot() {
+  const { normalized, rows, cols } = state.displayGrid;
   resizeCanvases(cols, rows, state.pixelSize);
   const image = plotCtx.createImageData(cols, rows);
 
@@ -229,7 +266,7 @@ function computeLocalAlignment(aSlice, bSlice) {
 }
 
 function buildAlignmentPanel(trace, row, col) {
-  const radius = Math.max(12, Math.floor(state.windowSize * 1.5));
+  const radius = Math.min(80, Math.max(12, Math.floor(state.windowSize * 1.5)));
   const aStart = Math.max(0, row - radius);
   const aEnd = Math.min(state.seqA.length, row + radius + 1);
   const bStart = Math.max(0, col - radius);
@@ -245,8 +282,11 @@ function buildAlignmentPanel(trace, row, col) {
 function drawOverlay(row, col) {
   overlayCtx.clearRect(0, 0, els.overlayCanvas.width, els.overlayCanvas.height);
   state.lastHover = { row, col };
-  const px = col * state.pixelSize;
-  const py = row * state.pixelSize;
+  if (!state.displayGrid) return;
+  const displayCol = Math.floor(col / state.displayGrid.colStep);
+  const displayRow = Math.floor(row / state.displayGrid.rowStep);
+  const px = displayCol * state.pixelSize;
+  const py = displayRow * state.pixelSize;
 
   overlayCtx.strokeStyle = 'rgba(120, 196, 255, 0.95)';
   overlayCtx.lineWidth = 1;
@@ -261,9 +301,11 @@ function drawOverlay(row, col) {
     const trace = computeTrace(row, col);
     overlayCtx.fillStyle = 'rgba(142, 255, 193, 0.9)';
     for (const point of trace) {
+      const traceCol = Math.floor(point.col / state.displayGrid.colStep);
+      const traceRow = Math.floor(point.row / state.displayGrid.rowStep);
       overlayCtx.fillRect(
-        point.col * state.pixelSize,
-        point.row * state.pixelSize,
+        traceCol * state.pixelSize,
+        traceRow * state.pixelSize,
         state.pixelSize,
         state.pixelSize,
       );
@@ -308,6 +350,10 @@ async function buildPlot() {
     return;
   }
   const ms = performance.now() - start;
+  buildDisplayGrid();
+  if (seqA.length > 1000 || seqB.length > 1000) {
+    fitView();
+  }
   renderPlot();
   applyZoom();
   overlayCtx.clearRect(0, 0, els.overlayCanvas.width, els.overlayCanvas.height);
@@ -324,14 +370,14 @@ function updateOutputs() {
 }
 
 function fitView() {
-  if (!state.normalizedGrid) return;
+  if (!state.normalizedGrid || !state.displayGrid) return;
   const availableWidth = els.canvasViewport.clientWidth || 1;
   const availableHeight = els.canvasViewport.clientHeight || 1;
-  const plotWidth = state.normalizedGrid.cols * state.pixelSize;
-  const plotHeight = state.normalizedGrid.rows * state.pixelSize;
-  const scale = Math.max(1, Math.floor(Math.min(availableWidth / plotWidth, availableHeight / plotHeight) * 10) / 10);
+  const plotWidth = state.displayGrid.cols * state.pixelSize;
+  const plotHeight = state.displayGrid.rows * state.pixelSize;
+  const scale = Math.min(24, Math.max(1, Math.floor(Math.min(availableWidth / plotWidth, availableHeight / plotHeight) * 10) / 10));
   state.zoom = scale;
-  els.zoomLevel.value = String(Math.min(24, Math.max(1, Math.round(scale))));
+  els.zoomLevel.value = String(Math.round(scale));
   updateOutputs();
   applyZoom();
 }
@@ -392,7 +438,7 @@ async function readSequenceFiles(files) {
 }
 
 function updateFastRender() {
-  if (!state.normalizedGrid) return;
+  if (!state.normalizedGrid || !state.displayGrid) return;
   state.threshold = Number(els.threshold.value) / 100;
   state.pixelSize = Number(els.pixelSize.value);
   state.zoom = Number(els.zoomLevel.value);
@@ -439,11 +485,13 @@ els.exportPngBtn.addEventListener('click', exportPng);
 els.exportSvgBtn.addEventListener('click', exportSvg);
 
 els.overlayCanvas.addEventListener('mousemove', (event) => {
-  if (!state.normalizedGrid) return;
+  if (!state.normalizedGrid || !state.displayGrid) return;
   const rect = els.overlayCanvas.getBoundingClientRect();
   const scale = state.zoom || 1;
-  const col = Math.floor((event.clientX - rect.left) / (state.pixelSize * scale));
-  const row = Math.floor((event.clientY - rect.top) / (state.pixelSize * scale));
+  const displayCol = Math.floor((event.clientX - rect.left) / (state.pixelSize * scale));
+  const displayRow = Math.floor((event.clientY - rect.top) / (state.pixelSize * scale));
+  const col = Math.min(state.normalizedGrid.cols - 1, displayCol * state.displayGrid.colStep);
+  const row = Math.min(state.normalizedGrid.rows - 1, displayRow * state.displayGrid.rowStep);
   if (
     row < 0 ||
     col < 0 ||
@@ -452,10 +500,23 @@ els.overlayCanvas.addEventListener('mousemove', (event) => {
   ) {
     return;
   }
-  drawOverlay(row, col);
+  state.pendingHover = { row, col };
+  if (!state.hoverFrame) {
+    state.hoverFrame = requestAnimationFrame(() => {
+      state.hoverFrame = 0;
+      if (state.pendingHover) {
+        drawOverlay(state.pendingHover.row, state.pendingHover.col);
+      }
+    });
+  }
 });
 
 els.overlayCanvas.addEventListener('mouseleave', () => {
+  if (state.hoverFrame) {
+    cancelAnimationFrame(state.hoverFrame);
+    state.hoverFrame = 0;
+  }
+  state.pendingHover = null;
   overlayCtx.clearRect(0, 0, els.overlayCanvas.width, els.overlayCanvas.height);
   els.hoverInfo.textContent = 'Hover over the plot to inspect coordinates.';
   els.alignmentMeta.textContent = 'Hover over the matrix to inspect the diagonal neighborhood.';

@@ -8,7 +8,7 @@ function scorePair(a, b, mode) {
 function computeDotplot(seqA, seqB, windowSize, mode) {
   const rows = seqA.length;
   const cols = seqB.length;
-  const raw = Array.from({ length: rows }, () => new Float32Array(cols));
+  const normalized = Array.from({ length: rows }, () => new Float32Array(cols));
   const half = Math.floor(windowSize / 2);
   let min = Number.POSITIVE_INFINITY;
   let max = Number.NEGATIVE_INFINITY;
@@ -22,23 +22,20 @@ function computeDotplot(seqA, seqB, windowSize, mode) {
         if (ai < 0 || ai >= rows || bj < 0 || bj >= cols) continue;
         score += scorePair(seqA[ai], seqB[bj], mode);
       }
-      raw[i][j] = score;
+      normalized[i][j] = score;
       if (score < min) min = score;
       if (score > max) max = score;
     }
   }
 
   const range = max - min || 1;
-  const normalized = raw.map((row) => {
-    const out = new Float32Array(row.length);
+  for (const row of normalized) {
     for (let i = 0; i < row.length; i += 1) {
-      out[i] = (row[i] - min) / range;
+      row[i] = (row[i] - min) / range;
     }
-    return out;
-  });
+  }
 
   return {
-    raw: raw.map((row) => [...row]),
     normalized: normalized.map((row) => [...row]),
     min,
     max,
