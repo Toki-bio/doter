@@ -5,7 +5,8 @@
 // ── state ────────────────────────────────────────────────────
 const S = {
   seqA: '', seqB: '',
-  norm: null, pixels: null, rows: 0, cols: 0,
+  scores: null, rows: 0, cols: 0,
+  scoreMin: 0, scoreMax: 1,
   threshold: 0.55, windowSize: 9, zoom: 1,
   showTrace: true, lastRow: -1, lastCol: -1,
   worker: null, computing: false,
@@ -82,14 +83,19 @@ function sizeCanvas(rows, cols) {
 }
 
 function paintImage() {
-  const { pixels, rows, cols, norm, threshold } = { ...S, threshold: S.threshold };
-  if (!pixels) return;
+  const { scores, rows, cols } = S;
+  if (!scores) return;
   sizeCanvas(rows, cols);
   const img = plotCtx.createImageData(cols, rows);
   const d = img.data;
-  const thr = S.threshold;
-  for (let i = 0, j = 0; i < rows * cols; i += 1, j += 4) {
-    const v = norm[i] >= thr ? 0 : pixels[i];
+  const range = S.scoreMax - S.scoreMin || 1;
+  const thr = S.threshold;   // 0..1 normalised
+  const total = rows * cols;
+  for (let i = 0, j = 0; i < total; i++, j += 4) {
+    // normalise score to 0..1
+    const n = (scores[i] - S.scoreMin) / range;
+    // Dotter convention: white background, dark where score ≥ threshold
+    const v = n >= thr ? Math.round((1 - n) * 255) : 255;
     d[j] = v; d[j+1] = v; d[j+2] = v; d[j+3] = 255;
   }
   plotCtx.putImageData(img, 0, 0);
@@ -103,17 +109,23 @@ function applyZoom() {
 }
 
 function fitView() {
-  if (!S.pixels) return;
+  if (!S.scores) return;
   const vw = el.viewport.clientWidth  || 600;
   const vh = el.viewport.clientHeight || 600;
-  const z = Math.max(1, Math.min(Math.floor(vw / S.cols), Math.floor(vh / S.rows), 24));
-  S.zoom = z;
-  el.zoom.value = String(z);
-  el.zoomOut.value = z + '×';
+  // For large sequences the fit zoom may be < 1 — that's fine (CSS scale handles it)
+  const z = Math.min(vw / S.cols, vh / S.rows, 24);
+  S.zoom = Math.max(0.1, Math.round(z * 10) / 10);  // round to 0.1
+  el.zoom.value = String(Math.min(24, Math.max(1, Math.round(S.zoom))));
+  el.zoomOut.value = (S.zoom < 1 ? S.zoom.toFixed(1) : Math.round(S.zoom)) + '×';
   applyZoom();
 }
 
 // ── overlay (crosshair + trace) ──────────────────────────────
+function normAt(r, c) {
+  const range = S.scoreMax - S.scoreMin || 1;
+  return (S.scores[r * S.cols + c] - S.scoreMin) / range;
+}
+
 function drawOverlay(row, col) {
   const ctx = overCtx;
   const w = S.cols, h = S.rows;
@@ -131,9 +143,9 @@ function drawOverlay(row, col) {
   if (S.showTrace) {
     ctx.fillStyle = 'rgba(142,255,193,0.8)';
     let r = row, c = col;
-    while (r >= 0 && c >= 0 && S.norm[r * w + c] >= S.threshold) { ctx.fillRect(c, r, 1, 1); r--; c--; }
+    while (r >= 0 && c >= 0 && normAt(r, c) >= S.threshold) { ctx.fillRect(c, r, 1, 1); r--; c--; }
     r = row + 1; c = col + 1;
-    while (r < h && c < w && S.norm[r * w + c] >= S.threshold) { ctx.fillRect(c, r, 1, 1); r++; c++; }
+    while (r < h && c < w && normAt(r, c) >= S.threshold) { ctx.fillRect(c, r, 1, 1); r++; c++; }
   }
 }
 
@@ -147,7 +159,7 @@ function updateAlignment(row, col) {
   const guide = [];
   const len = Math.min(aSlice.length, bSlice.length);
   for (let i = 0; i < len; i++) guide.push(aSlice[i] === bSlice[i] ? '|' : ' ');
-  el.aMeta.textContent = `A:${row+1}  B:${col+1}  score ${S.norm[row * S.cols + col].toFixed(3)}`;
+  el.aMeta.textContent = `A:${row+1}  B:${col+1}  score ${normAt(row, col).toFixed(3)}`;
   el.aPanel.textContent =
     `A ${String(aS+1).padStart(5)}  ${aSlice}\n` +
     `          ${guide.join('')}\n` +
@@ -156,7 +168,7 @@ function updateAlignment(row, col) {
 
 // ── hover info (fixed height, no reflow) ─────────────────────
 function updateHover(row, col) {
-  const sc = S.norm[row * S.cols + col];
+  const sc = normAt(row, col);
   el.hover.textContent = `A:${row+1}/${S.rows}  B:${col+1}/${S.cols}  score=${sc.toFixed(3)}`;
 }
 function clearHover() {
@@ -188,10 +200,11 @@ async function buildPlot() {
   const t0 = performance.now();
   try {
     const result = await compute(seqA, seqB, S.windowSize, el.mode.value);
-    S.pixels = new Uint8Array(result.pixels);   // may have been transferred
-    S.norm   = new Float32Array(result.norm);
-    S.rows   = result.rows;
-    S.cols   = result.cols;
+    S.scores   = new Int16Array(result.scores);
+    S.rows     = result.rows;
+    S.cols     = result.cols;
+    S.scoreMin = result.min;
+    S.scoreMax = result.max;
   } catch (err) {
     el.status.textContent = `Error: ${err.message}`;
     S.computing = false;
@@ -214,7 +227,7 @@ function syncOutputs() {
 }
 
 function fastRedraw() {
-  if (!S.pixels) return;
+  if (!S.scores) return;
   S.threshold = Number(el.threshold.value) / 100;
   paintImage();
   if (S.lastRow >= 0) drawOverlay(S.lastRow, S.lastCol);
@@ -225,7 +238,7 @@ function download(name, href) {
   const a = document.createElement('a'); a.href = href; a.download = name; a.click();
 }
 function exportPng() {
-  if (!S.pixels) return;
+  if (!S.scores) return;
   // Composite plot + overlay at 1:1
   const c = document.createElement('canvas'); c.width = S.cols; c.height = S.rows;
   const ctx = c.getContext('2d');
@@ -234,7 +247,7 @@ function exportPng() {
   download('doter.png', c.toDataURL('image/png'));
 }
 function exportSvg() {
-  if (!S.pixels) return;
+  if (!S.scores) return;
   // Encode the plot canvas as a PNG data-url embedded in an SVG for vector wrapper
   const c = document.createElement('canvas'); c.width = S.cols; c.height = S.rows;
   c.getContext('2d').drawImage(el.plot, 0, 0);
@@ -299,7 +312,7 @@ el.trace.addEventListener('change', () => {
 let hoverRaf = 0;
 
 el.overlay.addEventListener('mousemove', (e) => {
-  if (!S.norm) return;
+  if (!S.scores) return;
   if (hoverRaf) return;           // skip until previous frame is done
   hoverRaf = requestAnimationFrame(() => {
     hoverRaf = 0;
@@ -323,7 +336,7 @@ el.overlay.addEventListener('mouseleave', () => {
 
 // Ctrl+wheel zoom
 el.viewport.addEventListener('wheel', (e) => {
-  if (!S.norm || !e.ctrlKey) return;
+  if (!S.scores || !e.ctrlKey) return;
   e.preventDefault();
   const next = Math.min(24, Math.max(1, S.zoom + (e.deltaY < 0 ? 1 : -1)));
   S.zoom = next; el.zoom.value = String(next); syncOutputs(); applyZoom();
