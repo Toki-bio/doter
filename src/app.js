@@ -1,4 +1,4 @@
-/* ── Doter: main app ───────────────────────────────────────────
+/* ── Doter: main app  v2 ───────────────────────────────────────
    Draws dot plot + axes on a single canvas at screen resolution.
    No CSS transform tricks.  Zoom re-renders at proper pixel size.
    Axes show nucleotide positions like Staden's Dotter.           */
