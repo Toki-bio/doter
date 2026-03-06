@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Doter — interactive dot matrix viewer</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>Doter</h1>
+        <p class="subtitle">Dotter-style interactive dot matrix viewer for GitHub Pages</p>
+      </div>
+      <a class="header-link" href="https://pages.github.com/" target="_blank" rel="noreferrer">GitHub Pages ready</a>
+    </header>
+
+    <main class="layout">
+      <section class="controls card">
+        <div class="input-grid">
+          <label>
+            <span>Sequence A</span>
+            <textarea id="seqA" spellcheck="false">>seqA
+ACGTTGACCTGAAACCGTTACGTTGACCTGAAACCGTTACGTTGACC</textarea>
+          </label>
+
+          <label>
+            <span>Sequence B</span>
+            <textarea id="seqB" spellcheck="false">>seqB
+ACGTTGACCTGAAGCCGTTACGTCGACCTGAAACCGTTACGTTGACC</textarea>
+          </label>
+        </div>
+
+        <div class="toolbar">
+          <button id="renderBtn">Render plot</button>
+          <button id="recalcBtn" class="ghost">Recalculate scores</button>
+          <label>
+            <span>Window</span>
+            <input id="windowSize" type="range" min="1" max="61" step="2" value="9" />
+            <output id="windowSizeValue">9</output>
+          </label>
+          <label>
+            <span>Threshold</span>
+            <input id="threshold" type="range" min="0" max="100" step="1" value="55" />
+            <output id="thresholdValue">55</output>
+          </label>
+          <label>
+            <span>Pixel size</span>
+            <input id="pixelSize" type="range" min="1" max="8" step="1" value="4" />
+            <output id="pixelSizeValue">4</output>
+          </label>
+          <label>
+            <span>Zoom</span>
+            <input id="zoomLevel" type="range" min="1" max="24" step="1" value="4" />
+            <output id="zoomLevelValue">4×</output>
+          </label>
+          <label>
+            <span>Mode</span>
+            <select id="scoreMode">
+              <option value="identity">Identity</option>
+              <option value="dna-simple">DNA: +1 / -1</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="toolbar secondary">
+          <label>
+            <input id="reverseB" type="checkbox" />
+            <span>Reverse complement B</span>
+          </label>
+          <label>
+            <input id="showTrace" type="checkbox" checked />
+            <span>Show local diagonal trace</span>
+          </label>
+          <button id="fitViewBtn" class="ghost">Fit view</button>
+          <button id="exportPngBtn" class="ghost">Export PNG</button>
+          <button id="exportSvgBtn" class="ghost">Export SVG</button>
+          <button id="exampleBtn" class="ghost">Load repeat example</button>
+        </div>
+      </section>
+
+      <section class="viewer card">
+        <div class="viewer-header">
+          <div>
+            <h2>Dot matrix</h2>
+            <p id="statusLine">Ready. Render to compute the score image.</p>
+          </div>
+          <div id="hoverInfo" class="hover-info">Hover over the plot to inspect coordinates.</div>
+        </div>
+
+        <div id="dropZone" class="drop-zone" tabindex="0">
+          Drop one FASTA file to load Sequence A, or two FASTA files to fill both inputs.
+        </div>
+
+        <div class="canvas-shell">
+          <div id="canvasViewport" class="canvas-viewport">
+            <div id="canvasStage" class="canvas-stage">
+              <canvas id="plotCanvas" width="800" height="800"></canvas>
+              <canvas id="overlayCanvas" width="800" height="800"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <div class="alignment-panel card inset-card">
+          <div class="alignment-header">
+            <h3>Mini alignment panel</h3>
+            <p id="alignmentMeta">Hover over the matrix to inspect the diagonal neighborhood.</p>
+          </div>
+          <pre id="alignmentPanel" class="alignment-output">A: —
+   
+B: —</pre>
+        </div>
+      </section>
+
+      <section class="info-grid">
+        <article class="card">
+          <h2>What this implements</h2>
+          <ul>
+            <li>One-shot precompute of a similarity image.</li>
+            <li>Real-time mouse tracking with crosshair and diagonal trace.</li>
+            <li>Window, threshold, zoom, and fit controls to mimic Dotter-style exploration.</li>
+            <li>Drag-and-drop FASTA loading plus PNG/SVG export.</li>
+            <li>Pure static files, so it can be published directly via GitHub Pages.</li>
+          </ul>
+        </article>
+
+        <article class="card">
+          <h2>Notes</h2>
+          <p>
+            This version uses a lightweight windowed similarity score rather than the full historical Dotter algorithm,
+            but the interaction model matches the “precompute once, inspect instantly” workflow you described.
+          </p>
+        </article>
+      </section>
+    </main>
+
+    <script type="module" src="./src/app.js"></script>
+  </body>
+</html>

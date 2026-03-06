@@ -1,0 +1,10 @@
+{
+  "name": "doter",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Static Dotter-style interactive dot matrix viewer for GitHub Pages",
+  "scripts": {
+    "start": "python3 -m http.server 8000",
+    "check": "python3 -m py_compile ."
+  }
+}
