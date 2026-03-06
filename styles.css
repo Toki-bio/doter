@@ -56,6 +56,16 @@ p {
   margin-top: 6px;
 }
 
+.site-hint {
+  color: var(--muted);
+  margin-top: 8px;
+  font-size: 0.95rem;
+}
+
+.site-hint code {
+  color: var(--accent-2);
+}
+
 .header-link {
   color: var(--accent);
   text-decoration: none;

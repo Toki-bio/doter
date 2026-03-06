@@ -161,6 +161,73 @@ function computeTrace(row, col) {
   return trace;
 }
 
+function computeLocalAlignment(aSlice, bSlice) {
+  const matchScore = 2;
+  const mismatchScore = -1;
+  const gapScore = -2;
+  const rows = aSlice.length + 1;
+  const cols = bSlice.length + 1;
+  const score = Array.from({ length: rows }, () => new Int16Array(cols));
+  const pointer = Array.from({ length: rows }, () => new Uint8Array(cols));
+  let best = { value: 0, row: 0, col: 0 };
+
+  for (let i = 1; i < rows; i += 1) {
+    for (let j = 1; j < cols; j += 1) {
+      const diag = score[i - 1][j - 1] + (aSlice[i - 1] === bSlice[j - 1] ? matchScore : mismatchScore);
+      const up = score[i - 1][j] + gapScore;
+      const left = score[i][j - 1] + gapScore;
+      const cell = Math.max(0, diag, up, left);
+      score[i][j] = cell;
+      if (cell === 0) pointer[i][j] = 0;
+      else if (cell === diag) pointer[i][j] = 1;
+      else if (cell === up) pointer[i][j] = 2;
+      else pointer[i][j] = 3;
+      if (cell > best.value) {
+        best = { value: cell, row: i, col: j };
+      }
+    }
+  }
+
+  const alignedA = [];
+  const alignedB = [];
+  const guide = [];
+  let i = best.row;
+  let j = best.col;
+  while (i > 0 && j > 0 && score[i][j] > 0) {
+    const move = pointer[i][j];
+    if (move === 1) {
+      const aChar = aSlice[i - 1];
+      const bChar = bSlice[j - 1];
+      alignedA.push(aChar);
+      alignedB.push(bChar);
+      guide.push(aChar === bChar ? '|' : '.');
+      i -= 1;
+      j -= 1;
+    } else if (move === 2) {
+      alignedA.push(aSlice[i - 1]);
+      alignedB.push('-');
+      guide.push(' ');
+      i -= 1;
+    } else if (move === 3) {
+      alignedA.push('-');
+      alignedB.push(bSlice[j - 1]);
+      guide.push(' ');
+      j -= 1;
+    } else {
+      break;
+    }
+  }
+
+  return {
+    score: best.value,
+    startA: i,
+    startB: j,
+    alignedA: alignedA.reverse().join(''),
+    alignedB: alignedB.reverse().join(''),
+    guide: guide.reverse().join(''),
+  };
+}
+
 function buildAlignmentPanel(trace, row, col) {
   const radius = Math.max(12, Math.floor(state.windowSize * 1.5));
   const aStart = Math.max(0, row - radius);
@@ -169,20 +236,10 @@ function buildAlignmentPanel(trace, row, col) {
   const bEnd = Math.min(state.seqB.length, col + radius + 1);
   const aSlice = state.seqA.slice(aStart, aEnd);
   const bSlice = state.seqB.slice(bStart, bEnd);
-  const maxLen = Math.max(aSlice.length, bSlice.length);
-  const aChars = [];
-  const bChars = [];
-  const guide = [];
-  for (let i = 0; i < maxLen; i += 1) {
-    const aChar = aSlice[i] ?? ' ';
-    const bChar = bSlice[i] ?? ' ';
-    aChars.push(aChar);
-    bChars.push(bChar);
-    guide.push(aChar === bChar && aChar !== ' ' ? '|' : ' ');
-  }
+  const alignment = computeLocalAlignment(aSlice, bSlice);
   const traceSpan = trace.length ? `${trace[0].row + 1}:${trace[0].col + 1} → ${trace.at(-1).row + 1}:${trace.at(-1).col + 1}` : 'single point';
-  els.alignmentMeta.textContent = `Cursor A:${row + 1} B:${col + 1} · trace ${trace.length} cells · span ${traceSpan}`;
-  els.alignmentPanel.textContent = `A ${String(aStart + 1).padStart(5, ' ')}  ${aChars.join('')}\n          ${guide.join('')}\nB ${String(bStart + 1).padStart(5, ' ')}  ${bChars.join('')}`;
+  els.alignmentMeta.textContent = `Cursor A:${row + 1} B:${col + 1} · trace ${trace.length} cells · span ${traceSpan} · local score ${alignment.score}`;
+  els.alignmentPanel.textContent = `A ${String(aStart + alignment.startA + 1).padStart(5, ' ')}  ${alignment.alignedA}\n          ${alignment.guide}\nB ${String(bStart + alignment.startB + 1).padStart(5, ' ')}  ${alignment.alignedB}`;
 }
 
 function drawOverlay(row, col) {
