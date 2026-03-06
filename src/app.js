@@ -1,6 +1,14 @@
 /* ── Doter: main app ───────────────────────────────────────────
-   Clean rewrite.  Canvas is always 1 pixel = 1 cell.
-   Zoom is pure CSS transform.  Hover never causes layout reflow. */
+   Draws dot plot + axes on a single canvas at screen resolution.
+   No CSS transform tricks.  Zoom re-renders at proper pixel size.
+   Axes show nucleotide positions like Staden's Dotter.           */
+
+// ── constants ────────────────────────────────────────────────
+const AXIS_PAD   = 50;   // px reserved for axis labels (left / top)
+const TICK_LEN   = 5;
+const FONT       = '11px system-ui, sans-serif';
+const AXIS_COL   = '#333';
+const TICK_COL   = '#555';
 
 // ── state ────────────────────────────────────────────────────
 const S = {
@@ -10,6 +18,7 @@ const S = {
   threshold: 0.55, windowSize: 9, zoom: 1,
   showTrace: true, lastRow: -1, lastCol: -1,
   worker: null, computing: false,
+  dotImage: null,   // cached 1:1 ImageData of the dot matrix
 };
 
 // ── DOM refs ─────────────────────────────────────────────────
@@ -38,12 +47,11 @@ const el = {
   aPanel:      $('#alignmentPanel'),
   drop:        $('#dropZone'),
   viewport:    $('#canvasViewport'),
-  stage:       $('#canvasStage'),
-  plot:        $('#plotCanvas'),
+  canvas:      $('#plotCanvas'),
   overlay:     $('#overlayCanvas'),
 };
-const plotCtx = el.plot.getContext('2d', { alpha: false });
-const overCtx = el.overlay.getContext('2d');
+const ctx  = el.canvas.getContext('2d',  { alpha: false });
+const oCtx = el.overlay.getContext('2d');
 
 // ── helpers ──────────────────────────────────────────────────
 function parseFasta(raw) {
@@ -59,14 +67,11 @@ function getWorker() {
   if (!S.worker) S.worker = new Worker('./src/worker.js');
   return S.worker;
 }
-
 function compute(seqA, seqB, windowSize, mode) {
   return new Promise((res, rej) => {
     const w = getWorker();
     const ok = (e) => { w.removeEventListener('message', ok); w.removeEventListener('error', no);
-      if (e.data.error) { rej(new Error(e.data.error)); return; }
-      res(e.data);
-    };
+      if (e.data.error) { rej(new Error(e.data.error)); return; } res(e.data); };
     const no = (e) => { w.removeEventListener('message', ok); w.removeEventListener('error', no); rej(e); };
     w.addEventListener('message', ok);
     w.addEventListener('error', no);
@@ -74,82 +79,165 @@ function compute(seqA, seqB, windowSize, mode) {
   });
 }
 
+// ── axis tick helpers ────────────────────────────────────────
+function niceStep(seqLen, maxTicks) {
+  const raw = seqLen / maxTicks;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  let step;
+  if (norm <= 1)       step = 1;
+  else if (norm <= 2)  step = 2;
+  else if (norm <= 5)  step = 5;
+  else                 step = 10;
+  return Math.max(1, step * mag);
+}
+
 // ── rendering ────────────────────────────────────────────────
-function sizeCanvas(rows, cols) {
-  // Canvas = exactly rows × cols pixels.  Zoom is CSS only.
-  for (const c of [el.plot, el.overlay]) {
-    c.width = cols; c.height = rows;
-  }
-}
-
-function paintImage() {
-  const { scores, rows, cols } = S;
-  if (!scores) return;
-  sizeCanvas(rows, cols);
-  const img = plotCtx.createImageData(cols, rows);
-  const d = img.data;
-  const range = S.scoreMax - S.scoreMin || 1;
-  const thr = S.threshold;   // 0..1 normalised
-  const total = rows * cols;
-  for (let i = 0, j = 0; i < total; i++, j += 4) {
-    // normalise score to 0..1
-    const n = (scores[i] - S.scoreMin) / range;
-    // Dotter convention: white background, dark where score ≥ threshold
-    const v = n >= thr ? Math.round((1 - n) * 255) : 255;
-    d[j] = v; d[j+1] = v; d[j+2] = v; d[j+3] = 255;
-  }
-  plotCtx.putImageData(img, 0, 0);
-}
-
-function applyZoom() {
-  const z = S.zoom;
-  el.stage.style.transform = `scale(${z})`;
-  // Set layout size to scaled dimensions so scrollbars work correctly
-  el.stage.style.width  = `${S.cols * z}px`;
-  el.stage.style.height = `${S.rows * z}px`;
-}
-
-function fitView() {
-  if (!S.scores) return;
-  // Use the shell (the resizable container) for available space
-  const shell = el.viewport.parentElement;
-  const vw = shell.clientWidth  || el.viewport.clientWidth  || 600;
-  const vh = shell.clientHeight || el.viewport.clientHeight || 400;
-  if (S.cols === 0 || S.rows === 0) return;
-  // Fit the plot into the available space, cap at 24×
-  const z = Math.min(vw / S.cols, vh / S.rows, 24);
-  S.zoom = Math.max(0.1, Math.round(z * 10) / 10);
-  el.zoom.value = String(Math.min(24, Math.max(1, Math.round(S.zoom))));
-  syncOutputs();
-  applyZoom();
-}
-
-// ── overlay (crosshair + trace) ──────────────────────────────
 function normAt(r, c) {
   const range = S.scoreMax - S.scoreMin || 1;
   return (S.scores[r * S.cols + c] - S.scoreMin) / range;
 }
 
+function buildDotImage() {
+  const { scores, rows, cols } = S;
+  if (!scores) return;
+  const img = new ImageData(cols, rows);
+  const d = img.data;
+  const range = S.scoreMax - S.scoreMin || 1;
+  const thr = S.threshold;
+  for (let i = 0, j = 0; i < rows * cols; i++, j += 4) {
+    const n = (scores[i] - S.scoreMin) / range;
+    const v = n >= thr ? Math.round((1 - n) * 255) : 255;
+    d[j] = v; d[j+1] = v; d[j+2] = v; d[j+3] = 255;
+  }
+  S.dotImage = img;
+}
+
+function render() {
+  if (!S.dotImage) return;
+  const z = S.zoom;
+  const { rows, cols } = S;
+  const plotW = Math.round(cols * z);
+  const plotH = Math.round(rows * z);
+  const totalW = AXIS_PAD + plotW + 1;
+  const totalH = AXIS_PAD + plotH + 1;
+
+  el.canvas.width  = totalW;
+  el.canvas.height = totalH;
+  el.overlay.width  = totalW;
+  el.overlay.height = totalH;
+
+  // White background
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(0, 0, totalW, totalH);
+
+  // Draw the dot matrix scaled into the plot area
+  const tmp = document.createElement('canvas');
+  tmp.width = cols; tmp.height = rows;
+  tmp.getContext('2d').putImageData(S.dotImage, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.drawImage(tmp, AXIS_PAD, AXIS_PAD, plotW, plotH);
+
+  // ── Draw axes ────────────────────────────────────────────
+  ctx.font = FONT;
+
+  // Tick spacing
+  const maxTicksX = Math.max(2, Math.floor(plotW / 50));
+  const maxTicksY = Math.max(2, Math.floor(plotH / 40));
+  const stepX = niceStep(cols, maxTicksX);
+  const stepY = niceStep(rows, maxTicksY);
+
+  // Border around plot
+  ctx.strokeStyle = AXIS_COL;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(AXIS_PAD + 0.5, AXIS_PAD + 0.5, plotW, plotH);
+
+  // X ticks (top of plot)
+  ctx.fillStyle = TICK_COL;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'bottom';
+  for (let pos = stepX; pos <= cols; pos += stepX) {
+    const x = AXIS_PAD + Math.round(pos * z) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(x, AXIS_PAD);
+    ctx.lineTo(x, AXIS_PAD - TICK_LEN);
+    ctx.strokeStyle = TICK_COL;
+    ctx.stroke();
+    ctx.fillText(String(pos), x, AXIS_PAD - TICK_LEN - 1);
+  }
+
+  // Y ticks (left of plot)
+  ctx.textAlign = 'right';
+  ctx.textBaseline = 'middle';
+  for (let pos = stepY; pos <= rows; pos += stepY) {
+    const y = AXIS_PAD + Math.round(pos * z) + 0.5;
+    ctx.beginPath();
+    ctx.moveTo(AXIS_PAD, y);
+    ctx.lineTo(AXIS_PAD - TICK_LEN, y);
+    ctx.strokeStyle = TICK_COL;
+    ctx.stroke();
+    ctx.fillText(String(pos), AXIS_PAD - TICK_LEN - 2, y);
+  }
+
+  // Axis titles
+  ctx.fillStyle = AXIS_COL;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'top';
+  ctx.font = 'bold 12px system-ui, sans-serif';
+  ctx.fillText('Seq B', AXIS_PAD + plotW / 2, 2);
+  ctx.save();
+  ctx.translate(12, AXIS_PAD + plotH / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText('Seq A', 0, 0);
+  ctx.restore();
+}
+
+// ── overlay (crosshair + trace) ──────────────────────────────
+function canvasToCell(cx, cy) {
+  return {
+    col: Math.floor((cx - AXIS_PAD) / S.zoom),
+    row: Math.floor((cy - AXIS_PAD) / S.zoom),
+  };
+}
+
 function drawOverlay(row, col) {
-  const ctx = overCtx;
-  const w = S.cols, h = S.rows;
-  ctx.clearRect(0, 0, w, h);
+  const w = el.overlay.width, h = el.overlay.height;
+  oCtx.clearRect(0, 0, w, h);
+  const z = S.zoom;
+  const plotW = S.cols * z, plotH = S.rows * z;
 
-  // crosshair
-  ctx.strokeStyle = 'rgba(120,196,255,0.85)';
-  ctx.lineWidth = 1 / S.zoom;        // stays thin at any zoom
-  ctx.beginPath();
-  ctx.moveTo(0, row + 0.5); ctx.lineTo(w, row + 0.5);
-  ctx.moveTo(col + 0.5, 0); ctx.lineTo(col + 0.5, h);
-  ctx.stroke();
+  // Crosshair lines
+  const cx = AXIS_PAD + (col + 0.5) * z;
+  const cy = AXIS_PAD + (row + 0.5) * z;
+  oCtx.strokeStyle = 'rgba(80,160,255,0.7)';
+  oCtx.lineWidth = 1;
+  oCtx.beginPath();
+  oCtx.moveTo(AXIS_PAD, cy); oCtx.lineTo(AXIS_PAD + plotW, cy);
+  oCtx.moveTo(cx, AXIS_PAD); oCtx.lineTo(cx, AXIS_PAD + plotH);
+  oCtx.stroke();
 
-  // diagonal trace
+  // Position markers on axis margin
+  oCtx.fillStyle = 'rgba(80,160,255,0.95)';
+  oCtx.font = 'bold 11px system-ui, sans-serif';
+  oCtx.textAlign = 'center';
+  oCtx.textBaseline = 'bottom';
+  oCtx.fillText(String(col + 1), cx, AXIS_PAD - 1);
+  oCtx.textAlign = 'right';
+  oCtx.textBaseline = 'middle';
+  oCtx.fillText(String(row + 1), AXIS_PAD - 2, cy);
+
+  // Diagonal trace
   if (S.showTrace) {
-    ctx.fillStyle = 'rgba(142,255,193,0.8)';
+    oCtx.fillStyle = 'rgba(100,230,160,0.85)';
+    const pxSz = Math.max(1, Math.round(z));
     let r = row, c = col;
-    while (r >= 0 && c >= 0 && normAt(r, c) >= S.threshold) { ctx.fillRect(c, r, 1, 1); r--; c--; }
+    while (r >= 0 && c >= 0 && normAt(r, c) >= S.threshold) {
+      oCtx.fillRect(AXIS_PAD + c * z, AXIS_PAD + r * z, pxSz, pxSz); r--; c--;
+    }
     r = row + 1; c = col + 1;
-    while (r < h && c < w && normAt(r, c) >= S.threshold) { ctx.fillRect(c, r, 1, 1); r++; c++; }
+    while (r < S.rows && c < S.cols && normAt(r, c) >= S.threshold) {
+      oCtx.fillRect(AXIS_PAD + c * z, AXIS_PAD + r * z, pxSz, pxSz); r++; c++;
+    }
   }
 }
 
@@ -170,17 +258,35 @@ function updateAlignment(row, col) {
     `B ${String(bS+1).padStart(5)}  ${bSlice}`;
 }
 
-// ── hover info (fixed height, no reflow) ─────────────────────
+// ── hover ────────────────────────────────────────────────────
 function updateHover(row, col) {
-  const sc = normAt(row, col);
-  el.hover.textContent = `A:${row+1}/${S.rows}  B:${col+1}/${S.cols}  score=${sc.toFixed(3)}`;
+  el.hover.textContent = `A:${row+1}/${S.rows}  B:${col+1}/${S.cols}  score=${normAt(row, col).toFixed(3)}`;
 }
 function clearHover() {
-  el.hover.textContent = '\u00a0';   // non-breaking space keeps height
+  el.hover.textContent = '\u00a0';
   el.aMeta.textContent = '\u00a0';
   el.aPanel.textContent = 'A: —\n   \nB: —';
-  overCtx.clearRect(0, 0, S.cols, S.rows);
+  oCtx.clearRect(0, 0, el.overlay.width, el.overlay.height);
   S.lastRow = S.lastCol = -1;
+}
+
+// ── zoom / fit ───────────────────────────────────────────────
+function applyZoom() {
+  render();
+  if (S.lastRow >= 0) drawOverlay(S.lastRow, S.lastCol);
+}
+
+function fitView() {
+  if (!S.scores) return;
+  const shell = el.viewport.parentElement;
+  const vw = (shell.clientWidth  || 600) - AXIS_PAD - 20;
+  const vh = (shell.clientHeight || 400) - AXIS_PAD - 20;
+  if (S.cols === 0 || S.rows === 0) return;
+  const z = Math.min(vw / S.cols, vh / S.rows, 24);
+  S.zoom = Math.max(0.5, Math.round(z * 10) / 10);
+  el.zoom.value = String(Math.min(24, Math.max(1, Math.round(S.zoom))));
+  syncOutputs();
+  applyZoom();
 }
 
 // ── main build ───────────────────────────────────────────────
@@ -194,11 +300,9 @@ async function buildPlot() {
   S.seqA = seqA; S.seqB = seqB;
   S.windowSize = Number(el.window.value);
   S.threshold = Number(el.threshold.value) / 100;
-  S.zoom = Number(el.zoom.value);
   S.showTrace = el.trace.checked;
 
-  const total = seqA.length * seqB.length;
-  el.status.textContent = `Computing ${seqA.length} × ${seqB.length} (${(total/1e6).toFixed(1)}M cells)…`;
+  el.status.textContent = `Computing ${seqA.length} × ${seqB.length}…`;
   S.computing = true;
 
   const t0 = performance.now();
@@ -217,23 +321,25 @@ async function buildPlot() {
   const ms = performance.now() - t0;
   S.computing = false;
 
-  paintImage();
+  buildDotImage();
   fitView();
   clearHover();
   el.status.textContent = `${seqA.length} × ${seqB.length} in ${ms < 1000 ? ms.toFixed(0) + ' ms' : (ms/1000).toFixed(1) + ' s'}.`;
 }
 
-// ── slider updates (no recompute) ────────────────────────────
+// ── slider updates ───────────────────────────────────────────
 function syncOutputs() {
   el.windowOut.value   = el.window.value;
   el.thresholdOut.value = el.threshold.value;
-  el.zoomOut.value     = (S.zoom < 1 ? S.zoom.toFixed(1) : S.zoom >= 10 ? Math.round(S.zoom) : S.zoom.toFixed(1)) + '×';
+  const z = S.zoom;
+  el.zoomOut.value = (z < 1 ? z.toFixed(1) : z >= 10 ? Math.round(z) : z.toFixed(1)) + '×';
 }
 
 function fastRedraw() {
   if (!S.scores) return;
   S.threshold = Number(el.threshold.value) / 100;
-  paintImage();
+  buildDotImage();
+  render();
   if (S.lastRow >= 0) drawOverlay(S.lastRow, S.lastCol);
 }
 
@@ -243,21 +349,21 @@ function download(name, href) {
 }
 function exportPng() {
   if (!S.scores) return;
-  // Composite plot + overlay at 1:1
-  const c = document.createElement('canvas'); c.width = S.cols; c.height = S.rows;
-  const ctx = c.getContext('2d');
-  ctx.drawImage(el.plot, 0, 0);
-  ctx.drawImage(el.overlay, 0, 0);
+  const c = document.createElement('canvas');
+  c.width = el.canvas.width; c.height = el.canvas.height;
+  const cx = c.getContext('2d');
+  cx.drawImage(el.canvas, 0, 0);
+  cx.drawImage(el.overlay, 0, 0);
   download('doter.png', c.toDataURL('image/png'));
 }
 function exportSvg() {
   if (!S.scores) return;
-  // Encode the plot canvas as a PNG data-url embedded in an SVG for vector wrapper
-  const c = document.createElement('canvas'); c.width = S.cols; c.height = S.rows;
-  c.getContext('2d').drawImage(el.plot, 0, 0);
+  const w = el.canvas.width, h = el.canvas.height;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  c.getContext('2d').drawImage(el.canvas, 0, 0);
   const dataUrl = c.toDataURL('image/png');
-  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${S.cols}" height="${S.rows}">` +
-    `<image href="${dataUrl}" width="${S.cols}" height="${S.rows}" image-rendering="pixelated"/>` +
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="${w}" height="${h}">` +
+    `<image href="${dataUrl}" width="${w}" height="${h}"/>` +
     `</svg>`;
   download('doter.svg', URL.createObjectURL(new Blob([svg], { type: 'image/svg+xml' })));
 }
@@ -272,7 +378,6 @@ async function loadFiles(files) {
   el.status.textContent = `Loaded ${texts.length} file(s). Click Render.`;
 }
 
-// ── example ──────────────────────────────────────────────────
 function loadExample() {
   el.seqA.value = '>repeat_A\nTTTCGAGACCTGAAACTGTTTCGAGACCTGAAACTGTTTCGAGACCTGAAACTG';
   el.seqB.value = '>repeat_B\nTTTCGAGACCTGAAACTGATTCGAGACCGGAAACTGTTTCGAGACCTGAAACTG';
@@ -280,8 +385,6 @@ function loadExample() {
 }
 
 // ── event wiring ─────────────────────────────────────────────
-
-// Render / recalc
 el.render.addEventListener('click', buildPlot);
 el.recalc.addEventListener('click', buildPlot);
 el.example.addEventListener('click', loadExample);
@@ -289,17 +392,14 @@ el.fit.addEventListener('click', fitView);
 el.pngBtn.addEventListener('click', exportPng);
 el.svgBtn.addEventListener('click', exportSvg);
 
-// Threshold → instant repaint (no recompute)
 el.threshold.addEventListener('input', () => { syncOutputs(); fastRedraw(); });
 
-// Zoom → CSS only
 el.zoom.addEventListener('input', () => {
-  syncOutputs();
   S.zoom = Number(el.zoom.value);
+  syncOutputs();
   applyZoom();
 });
 
-// Window / mode / revcomp → just update label, require explicit recompute
 for (const inp of [el.window, el.mode, el.revB]) {
   inp.addEventListener('input', syncOutputs);
   inp.addEventListener('change', () => {
@@ -312,20 +412,18 @@ el.trace.addEventListener('change', () => {
   if (S.lastRow >= 0) drawOverlay(S.lastRow, S.lastCol);
 });
 
-// ── mouse interaction on overlay canvas ──────────────────────
+// ── mouse interaction ────────────────────────────────────────
 let hoverRaf = 0;
 
 el.overlay.addEventListener('mousemove', (e) => {
   if (!S.scores) return;
-  if (hoverRaf) return;           // skip until previous frame is done
+  if (hoverRaf) return;
   hoverRaf = requestAnimationFrame(() => {
     hoverRaf = 0;
     const rect = el.overlay.getBoundingClientRect();
-    const z = S.zoom;
-    const col = Math.floor((e.clientX - rect.left) / z);
-    const row = Math.floor((e.clientY - rect.top) / z);
+    const { row, col } = canvasToCell(e.clientX - rect.left, e.clientY - rect.top);
     if (row < 0 || col < 0 || row >= S.rows || col >= S.cols) return;
-    if (row === S.lastRow && col === S.lastCol) return;  // no change
+    if (row === S.lastRow && col === S.lastCol) return;
     S.lastRow = row; S.lastCol = col;
     drawOverlay(row, col);
     updateHover(row, col);
@@ -344,28 +442,26 @@ el.viewport.addEventListener('wheel', (e) => {
   e.preventDefault();
 
   const oldZ = S.zoom;
-  // Finer steps: ±10% per tick
   const factor = e.deltaY < 0 ? 1.15 : 1 / 1.15;
-  const next = Math.min(24, Math.max(0.1, oldZ * factor));
-  // Round to 1 decimal
-  S.zoom = Math.round(next * 10) / 10;
+  S.zoom = Math.max(0.5, Math.min(24, Math.round(oldZ * factor * 10) / 10));
 
-  // Zoom toward mouse cursor
   const rect = el.viewport.getBoundingClientRect();
   const mx = e.clientX - rect.left + el.viewport.scrollLeft;
   const my = e.clientY - rect.top  + el.viewport.scrollTop;
   const ratio = S.zoom / oldZ;
-  el.viewport.scrollLeft = mx * ratio - (e.clientX - rect.left);
-  el.viewport.scrollTop  = my * ratio - (e.clientY - rect.top);
 
   el.zoom.value = String(Math.min(24, Math.max(1, Math.round(S.zoom))));
   syncOutputs();
   applyZoom();
+
+  el.viewport.scrollLeft = mx * ratio - (e.clientX - rect.left);
+  el.viewport.scrollTop  = my * ratio - (e.clientY - rect.top);
 }, { passive: false });
 
 // Pan by dragging
 let pan = null;
 el.viewport.addEventListener('mousedown', (e) => {
+  if (e.button !== 0) return;
   pan = { x: e.clientX, y: e.clientY, sl: el.viewport.scrollLeft, st: el.viewport.scrollTop };
   el.viewport.classList.add('panning');
 });
