@@ -100,10 +100,9 @@ output { color: var(--muted); font-size: 0.85rem; min-width: 2ch; }
 .canvas-viewport.panning { cursor: grabbing; }
 .canvas-stage {
   position: relative; transform-origin: top left;
-  width: fit-content; height: fit-content;
 }
 canvas { display: block; image-rendering: pixelated; }
-#overlayCanvas { position: absolute; inset: 0; pointer-events: auto; }
+#overlayCanvas { position: absolute; top: 0; left: 0; pointer-events: auto; }
 
 /* ── alignment panel ───────────────────────────────────────── */
 .align-box { margin-top: 6px; }

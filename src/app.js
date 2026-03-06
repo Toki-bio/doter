@@ -111,13 +111,16 @@ function applyZoom() {
 
 function fitView() {
   if (!S.scores) return;
-  const vw = el.viewport.clientWidth  || 600;
-  const vh = el.viewport.clientHeight || 600;
-  // For large sequences the fit zoom may be < 1 — that's fine (CSS scale handles it)
+  // Use the shell (the resizable container) for available space
+  const shell = el.viewport.parentElement;
+  const vw = shell.clientWidth  || el.viewport.clientWidth  || 600;
+  const vh = shell.clientHeight || el.viewport.clientHeight || 400;
+  if (S.cols === 0 || S.rows === 0) return;
+  // Fit the plot into the available space, cap at 24×
   const z = Math.min(vw / S.cols, vh / S.rows, 24);
-  S.zoom = Math.max(0.1, Math.round(z * 10) / 10);  // round to 0.1
+  S.zoom = Math.max(0.1, Math.round(z * 10) / 10);
   el.zoom.value = String(Math.min(24, Math.max(1, Math.round(S.zoom))));
-  el.zoomOut.value = (S.zoom < 1 ? S.zoom.toFixed(1) : Math.round(S.zoom)) + '×';
+  syncOutputs();
   applyZoom();
 }
 
